@@ -3,3 +3,8 @@ Writing_part/venv/
 Writing_part/slova/
 Writing_part/data/
 __pycache__/
+/home/mihailo/Documents/projects/lk-s-2025-air-writing/models/emnist-letters-train.csv
+dataset/emnist-letters-train.csv
+models/emnist-letters-train.csv
+models/emnist-letters-test.csv
+models/weights-convolutional 1/
