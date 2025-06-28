@@ -2,10 +2,10 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import os
+import datetime
 
 # za čuvanje slike cele reči 
 def save_word_image(canvas, folder, idx):
-
     gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
     coords = cv2.findNonZero(thresh)
@@ -15,7 +15,8 @@ def save_word_image(canvas, folder, idx):
         word_img = canvas[y:y+h, x:x+w]
     else:
         word_img = canvas.copy()
-    filename = os.path.join(folder, f'word_{idx}.png')
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(folder, f'word_{idx}_{timestamp}.png')
     success = cv2.imwrite(filename, word_img)
     print(f"[DEBUG] Čuvam ceo crtež u: {filename}, success: {success}")
     if success:
