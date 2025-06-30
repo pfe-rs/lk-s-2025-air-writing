@@ -3,6 +3,9 @@ import mediapipe as mp
 import numpy as np
 import os
 import datetime
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 # za čuvanje slike cele reči 
 def save_word_image(canvas, folder, idx):
@@ -23,6 +26,59 @@ def save_word_image(canvas, folder, idx):
         segment_letters(filename)
     return success
 
+# definicija CNN modela, da bi se koristila u handtrackingu direktno.
+#
+class CNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1, padding=1)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1, padding=1)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.conv3 = nn.Conv2d(64, 128, 3, 1, padding=1)
+        self.pool3 = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout(p=0.3)
+        self.fcc1 = nn.Linear(128 * 3 * 3, 128)
+        self.fcc2 = nn.Linear(128, 26)
+    def forward(self, x):
+        x = self.pool1(F.relu(self.conv1(x)))
+        x = self.pool2(F.relu(self.conv2(x)))
+        x = self.pool3(F.relu(self.conv3(x)))
+        x = x.view(-1, 128 * 3 * 3)
+        x = F.relu(self.fcc1(x))
+        x = self.dropout(x)
+        x = self.fcc2(x)
+        return x
+
+# -IVO- ovo moras izmeniti za tvoje tezine ako ih budes imala, ili da ti posaljem moje koje sam korsitio ovde.
+MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    'models', 'saved weights-labeled', '/home/mihailo/Documents/projects/lk-s-2025-air-writing/models/saved weights-labeled/3. sa 3. transformisani dataset 1 model_epoch_9_20250630_125703.pth'
+)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+cnn_model = CNN().to(device)
+cnn_model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+cnn_model.eval()
+
+
+def load_emnist_mapping(mapping_path):
+    mapping = {}
+    with open(mapping_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                idx = int(parts[0])
+                letter = chr(int(parts[1]))  # ASCII code
+                mapping[idx] = letter
+    return mapping
+
+EMNIST_MAPPING_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    'models', 'emnist-letters-mapping.txt'
+)
+EMNIST_LABELS_MAP = load_emnist_mapping(EMNIST_MAPPING_PATH)
+
 #za cuvanje slova
 def segment_letters(word_img_path):
     letters_dir = os.path.join(os.path.dirname(__file__), 'slova')
@@ -33,20 +89,16 @@ def segment_letters(word_img_path):
         return
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
-
-    # ssa
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 15))
     morphed = cv2.dilate(thresh, kernel, iterations=1)
-    # pronalayenje kontura
     contours, _ = cv2.findContours(morphed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = [cv2.boundingRect(cnt) for cnt in contours]
-    #sortiranje po x-osi (s leva na desno)
     boxes.sort(key=lambda b: b[0])
-    #)
     img_h, img_w = img.shape[:2]
     min_w, min_h = 10, 10
     max_w, max_h = int(0.9 * img_w), int(0.9 * img_h)
     letter_idx = 1
+    recognized_letters = []
     for (x, y, w, h) in boxes:
         if w < min_w or h < min_h:
             continue
@@ -58,18 +110,28 @@ def segment_letters(word_img_path):
         x2 = min(x + w + pad, img_w)
         y2 = min(y + h + pad, img_h)
         letter_img = img[y1:y2, x1:x2]
-        #grayscale
         letter_gray = cv2.cvtColor(letter_img, cv2.COLOR_BGR2GRAY)
-        # Automatski prag (Otsu) za binarizaciju
         _, letter_bin = cv2.threshold(letter_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        #letter_bin = cv2.bitwise_not(letter_bin)
-
         letter_resized = cv2.resize(letter_bin, (28, 28), interpolation=cv2.INTER_AREA)
-        letter_path = os.path.join(letters_dir, f'letter_{letter_idx}.png')
+        letter_path = os.path.join(letters_dir, f"letter_{letter_idx}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png")
         cv2.imwrite(letter_path, letter_resized)
         print(f"[DEBUG] Sačuvano slovo: {letter_path}")
+        # ovde cnn provaljuje slova
+        try:
+            tensor = torch.tensor(letter_resized, dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 255.0
+            tensor = tensor.to(device)
+            with torch.no_grad():
+                output = cnn_model(tensor)
+                pred_idx = int(torch.argmax(output, dim=1).item())
+                emnist_label = pred_idx + 1  # EMNIST labels are 1-based
+                pred_letter = EMNIST_LABELS_MAP.get(emnist_label, '?')
+                recognized_letters.append(pred_letter)
+                print(f"[PREDICT] Prepoznato slovo: {pred_letter}")
+        except Exception as e:
+            print(f"[ERROR] Greška u prepoznavanju slova: {e}")
         letter_idx += 1
+    if recognized_letters:
+        print(f"[WORD] Prepoznata reč: {''.join(recognized_letters)}")
 
 
 def merge_letter_boxes(boxes, x_thresh=30, y_thresh=20):
