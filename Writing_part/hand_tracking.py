@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+recognized_text = ""  # Globalna promenljiva za prepoznati tekst
+
 # za čuvanje slike cele reči 
 def save_word_image(canvas, folder, idx):
     gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
@@ -131,7 +133,12 @@ def segment_letters(word_img_path):
             print(f"[ERROR] Greška u prepoznavanju slova: {e}")
         letter_idx += 1
     if recognized_letters:
-        print(f"[WORD] Prepoznata reč: {''.join(recognized_letters)}")
+        word = ''.join(recognized_letters)
+        print(f"[WORD] Prepoznata reč: {word}")
+        global recognized_text
+        if recognized_text:
+            recognized_text += " "
+        recognized_text += word
 
 
 def merge_letter_boxes(boxes, x_thresh=30, y_thresh=20):
@@ -188,6 +195,45 @@ def fingers_up(landmarks):
     for tip in tips[1:]:
         fingers.append(landmarks[tip].y < landmarks[tip - 2].y)
     return fingers  # [palac, kažiprst, srednji, domali, mali]
+
+def draw_text_bubble(img, text, max_width=900, max_lines=4, font=cv2.FONT_HERSHEY_SIMPLEX, font_scale=1.2, font_thickness=2, text_color=(30, 255, 30), bg_color=(30, 30, 30, 180), margin=20, line_spacing=12):
+    
+    words = text.split(' ')
+    lines = []
+    current_line = ''
+    for word in words:
+        test_line = current_line + (' ' if current_line else '') + word
+        (w, h), _ = cv2.getTextSize(test_line, font, font_scale, font_thickness)
+        if w > max_width and current_line:
+            lines.append(current_line)
+            current_line = word
+        else:
+            current_line = test_line
+    if current_line:
+        lines.append(current_line)
+    # samo se poslednje prikazuju
+    lines = lines[-max_lines:]
+    # ukupna visina
+    (w, h), _ = cv2.getTextSize('A', font, font_scale, font_thickness)
+    total_height = h * len(lines) + line_spacing * (len(lines) - 1) + 2 * margin
+    max_line_width = max([cv2.getTextSize(line, font, font_scale, font_thickness)[0][0] for line in lines] + [1])
+    bubble_width = max_line_width + 2 * margin
+    bubble_height = total_height
+    # Pozicija teksta
+    x = int((img.shape[1] - bubble_width) / 2)
+    y = 10
+    # Nacrtaj poluprovidnu pozadinu
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x, y), (x + bubble_width, y + bubble_height), bg_color[:3], -1)
+    alpha = bg_color[3] / 255.0
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+    # crtanje teksta
+    y_text = y + margin + h
+    for line in lines:
+        (w_line, _), _ = cv2.getTextSize(line, font, font_scale, font_thickness)
+        x_text = x + int((bubble_width - w_line) / 2)
+        cv2.putText(img, line, (x_text, y_text), font, font_scale, text_color, font_thickness, cv2.LINE_AA)
+        y_text += h + line_spacing
 
 with mp_hands.Hands(
         static_image_mode=False,
@@ -261,6 +307,9 @@ with mp_hands.Hands(
             cv2.circle(image, eraser_center, 40, (0, 255, 255), 2)
         # Kombinuj originalni snimak i platno da bi se videlo šta je nacrtano
         img_out = cv2.addWeighted(image, 0.5, canvas, 0.5, 0)
+        # Prikaz prepoznatog teksta na ekranu
+        if recognized_text:
+            draw_text_bubble(img_out, recognized_text)
         cv2.imshow('MediaPipe Hands', img_out)
 
         if cv2.waitKey(1) & 0xFF == 27:
