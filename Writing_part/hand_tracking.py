@@ -6,6 +6,8 @@ import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
+import pandas as pd
 
 recognized_text = ""  # Globalna promenljiva za prepoznati tekst
 
@@ -23,10 +25,26 @@ def save_word_image(canvas, folder, idx):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = os.path.join(folder, f'word_{idx}_{timestamp}.png')
     success = cv2.imwrite(filename, word_img)
-    print(f"[DEBUG] Čuvam ceo crtež u: {filename}, success: {success}")
+    print(f" Čuvam ceo crtež u: {filename}, success: {success}")
     if success:
         segment_letters(filename)
     return success
+
+class EMNISTDataset(Dataset):
+    def __init__(self, csv_path):
+        df = pd.read_csv(csv_path)
+        self.X = df.iloc[:, 1:].values.reshape(-1, 28, 28).astype(np.uint8)
+        self.y = df.iloc[:, 0].values.astype(np.int64) - 1  # oduzeto 1 da bi bilo od 0 do 25
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        image = self.X[idx]
+        label = self.y[idx]
+        image = torch.tensor(image, dtype=torch.float32).unsqueeze(0) / 255.0
+        label = torch.tensor(label, dtype=torch.long)
+        return image, label
 
 # definicija CNN modela, da bi se koristila u handtrackingu direktno.
 #
@@ -55,7 +73,7 @@ class CNN(nn.Module):
 # -IVO- ovo moras izmeniti za tvoje tezine ako ih budes imala, ili da ti posaljem moje koje sam korsitio ovde.
 MODEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    'models', 'saved weights-labeled', '/home/mihailo/Documents/projects/lk-s-2025-air-writing/models/saved weights-labeled/3. sa 3. transformisani dataset 1 model_epoch_9_20250630_125703.pth'
+    'models', 'saved weights-labeled', '3. sa 3. transformisani dataset 1 model_epoch_9_20250630_125703.pth'
 )
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -82,6 +100,8 @@ EMNIST_MAPPING_PATH = os.path.join(
 EMNIST_LABELS_MAP = load_emnist_mapping(EMNIST_MAPPING_PATH)
 
 #za cuvanje slova
+last_segmented_letters = []  # lista tuple: (slika 28x28, predikcija)
+
 def segment_letters(word_img_path):
     letters_dir = os.path.join(os.path.dirname(__file__), 'slova')
     os.makedirs(letters_dir, exist_ok=True)
@@ -101,6 +121,8 @@ def segment_letters(word_img_path):
     max_w, max_h = int(0.9 * img_w), int(0.9 * img_h)
     letter_idx = 1
     recognized_letters = []
+    global last_segmented_letters
+    last_segmented_letters = []
     for (x, y, w, h) in boxes:
         if w < min_w or h < min_h:
             continue
@@ -128,6 +150,7 @@ def segment_letters(word_img_path):
                 emnist_label = pred_idx + 1  # EMNIST labels are 1-based
                 pred_letter = EMNIST_LABELS_MAP.get(emnist_label, '?')
                 recognized_letters.append(pred_letter)
+                last_segmented_letters.append((letter_resized.copy(), pred_letter))
                 print(f"[PREDICT] Prepoznato slovo: {pred_letter}")
         except Exception as e:
             print(f"[ERROR] Greška u prepoznavanju slova: {e}")
@@ -140,6 +163,25 @@ def segment_letters(word_img_path):
             recognized_text += " "
         recognized_text += word
 
+def draw_segmented_letters_panel(img, letters, panel_height=80, margin=10):
+    if not letters:
+        return
+    n = len(letters)
+    letter_size = 56
+    panel_width = n * (letter_size + margin) + margin
+    h, w = img.shape[:2]
+    x0 = max((w - panel_width) // 2, 0)
+    y0 = h - panel_height - 10
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + panel_width, y0 + panel_height), (30, 30, 30), -1)
+    cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+    for i, (letter_img, pred) in enumerate(letters):
+        letter_img_color = cv2.cvtColor(letter_img, cv2.COLOR_GRAY2BGR)
+        letter_img_resized = cv2.resize(letter_img_color, (letter_size, letter_size), interpolation=cv2.INTER_NEAREST)
+        x = x0 + margin + i * (letter_size + margin)
+        y = y0 + margin
+        img[y:y+letter_size, x:x+letter_size] = letter_img_resized
+        cv2.putText(img, str(pred), (x, y+letter_size+22), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2, cv2.LINE_AA)
 
 def merge_letter_boxes(boxes, x_thresh=30, y_thresh=20):
     if not boxes:
@@ -235,6 +277,27 @@ def draw_text_bubble(img, text, max_width=900, max_lines=4, font=cv2.FONT_HERSHE
         cv2.putText(img, line, (x_text, y_text), font, font_scale, text_color, font_thickness, cv2.LINE_AA)
         y_text += h + line_spacing
 
+def draw_gesture_feedback(img, recognizing=False, eraser=False):
+    h, w = img.shape[:2]
+    overlay = img.copy()
+    if recognizing:
+        
+        cv2.rectangle(overlay, (10, 10), (w-10, h-10), (0, 255, 0), 6)
+        cv2.putText(overlay, "Samo malo", (w-230, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 3, cv2.LINE_AA)
+    if eraser:
+        )
+        cv2.rectangle(overlay, (20, 20), (w-20, h-20), (0, 255, 255), 4)
+        eraser_x, eraser_y = 60, 60
+        cv2.rectangle(overlay, (eraser_x-25, eraser_y-15), (eraser_x+25, eraser_y+15), (0,255,255), -1, lineType=cv2.LINE_AA)
+        cv2.ellipse(overlay, (eraser_x-25, eraser_y), (15,15), 0, 90, 270, (0,255,255), -1, lineType=cv2.LINE_AA)
+        cv2.ellipse(overlay, (eraser_x+25, eraser_y), (15,15), 0, 270, 90, (0,255,255), -1, lineType=cv2.LINE_AA)
+        
+        cv2.rectangle(overlay, (eraser_x-25, eraser_y-15), (eraser_x+25, eraser_y+15), (80,80,80), 2, lineType=cv2.LINE_AA)
+        cv2.ellipse(overlay, (eraser_x-25, eraser_y), (15,15), 0, 90, 270, (80,80,80), 2, lineType=cv2.LINE_AA)
+        cv2.ellipse(overlay, (eraser_x+25, eraser_y), (15,15), 0, 270, 90, (80,80,80), 2, lineType=cv2.LINE_AA)
+    alpha = 0.32 if recognizing or eraser else 0
+    cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, img)
+
 with mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
@@ -301,15 +364,19 @@ with mp_hands.Hands(
             else:
                 print("[DEBUG] Preskočeno čuvanje prazne slike!")
         gesture_word_prev = gesture_word
-        # Gumica
+        # gumica
         if erase and eraser_center is not None:
             cv2.circle(canvas, eraser_center, 40, (0, 0, 0), -1)
             cv2.circle(image, eraser_center, 40, (0, 255, 255), 2)
-        # Kombinuj originalni snimak i platno da bi se videlo šta je nacrtano
+        
         img_out = cv2.addWeighted(image, 0.5, canvas, 0.5, 0)
         # Prikaz prepoznatog teksta na ekranu
         if recognized_text:
             draw_text_bubble(img_out, recognized_text)
+        # Primer
+        draw_gesture_feedback(img_out, recognizing=gesture_word, eraser=erase)
+        if last_segmented_letters:
+            draw_segmented_letters_panel(img_out, last_segmented_letters)
         cv2.imshow('MediaPipe Hands', img_out)
 
         if cv2.waitKey(1) & 0xFF == 27:
