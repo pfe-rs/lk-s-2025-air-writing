@@ -12,3 +12,6 @@ dataset/emnist-letters-train-transformed.csv
 models/emnist-letters-test-transformed.csv
 models/saved weights-labeled/3. sa 3. transformisani dataset 1 model_epoch_9_20250630_125703.pth
 models/saved weights-labeled/4. sa 3. sloja transformisani dataset 93.% tacnost model_epoch_15_20250630_125703.pth
+models/yolo/yolo_dataset.zip
+models/yolo/yolo_dataset
+models/yolo/yolo.ipynb
