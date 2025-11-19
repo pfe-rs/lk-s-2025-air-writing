@@ -3,11 +3,80 @@ import mediapipe as mp
 import numpy as np
 import os
 import datetime
+import sys
+from pathlib import Path
+from typing import List, Optional
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-recognized_text = ""  # Globalna promenljiva za prepoznati tekst
+CURRENT_DIR = Path(__file__).resolve().parent
+PARENT_DIR = CURRENT_DIR.parent
+if str(PARENT_DIR) not in sys.path:
+    sys.path.insert(0, str(PARENT_DIR))
+
+try:
+    from models.language_model.language_model import correct_word  # type: ignore
+except ImportError:
+    # Jezički model nije dostupan – radićemo bez korekcije.
+    correct_word = None  # type: ignore
+
+recognized_text = ""  # Globalna promenljiva za prikaz prepoznatog teksta
+recognized_history: List[str] = []  # Čuvanje reči za potrebe LM-a kada je dostupan
+debug_letter_images: List[np.ndarray] = []  # Slike svih slova poslednje segmentisane reči
+last_recognized_display: str = ""
+
+LETTER_GRID_COLS = 8
+LETTER_TILE = 56
+LETTER_MARGIN = 6
+UI_PANEL_WIDTH = 360
+UI_BG_COLOR = (24, 24, 24)
+UI_TEXT_COLOR = (230, 230, 230)
+UI_ACCENT_COLOR = (0, 180, 255)
+UI_SECTION_MARGIN = 18
+UI_FONT = cv2.FONT_HERSHEY_SIMPLEX
+UI_FONT_SCALE = 0.5
+UI_FONT_THICKNESS = 1
+ACCENT_MAP = str.maketrans({
+    "č": "c", "ć": "c", "š": "s", "ž": "z", "đ": "dj",
+    "Č": "C", "Ć": "C", "Š": "S", "Ž": "Z", "Đ": "DJ",
+    "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u",
+    "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U",
+    "ä": "a", "ö": "o", "ü": "u", "ß": "ss",
+})
+UI_INSTRUCTIONS_RAW = [
+    "Gest 1: Kažiprst = crtanje",
+    "Gest 2: Svi prsti = gumica",
+    "Gest 3: Kažiprst + mali = segment reči",
+    "ESC: izlaz iz demonstracije",
+]
+
+def normalize_text(text: str) -> str:
+    return text.translate(ACCENT_MAP)
+
+
+UI_INSTRUCTIONS = [normalize_text(line) for line in UI_INSTRUCTIONS_RAW]
+
+
+def resize_with_padding(img, size=28, margin=2):
+    h, w = img.shape[:2]
+    if h == 0 or w == 0:
+        return np.zeros((size, size), dtype=img.dtype)
+    max_dim = max(h, w)
+    scale = (size - 2 * margin) / max_dim if max_dim > 0 else 1.0
+    if scale <= 0:
+        scale = 1.0
+    scale = min(scale, 3.0)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    resized = cv2.resize(img, (new_w, new_h), interpolation=interpolation)
+    canvas = np.zeros((size, size), dtype=img.dtype)
+    x_offset = (size - new_w) // 2
+    y_offset = (size - new_h) // 2
+    canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+    return canvas
 
 # za čuvanje slike cele reči 
 def save_word_image(canvas, folder, idx):
@@ -52,11 +121,26 @@ class CNN(nn.Module):
         x = self.fcc2(x)
         return x
 
-# -IVO- ovo moras izmeniti za tvoje tezine ako ih budes imala, ili da ti posaljem moje koje sam korsitio ovde.
-MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    'models', 'saved weights-labeled', '/home/mihailo/Documents/projects/lk-s-2025-air-writing/models/saved weights-labeled/3. sa 3. transformisani dataset 1 model_epoch_9_20250630_125703.pth'
-)
+# Pokušavamo da pronađemo model automatski – prvo kroz env var, zatim iz direktorijuma.
+def resolve_model_path() -> Path:
+    env_path = os.environ.get("HANDTRACK_CNN_WEIGHTS")
+    if env_path:
+        path = Path(env_path).expanduser().resolve()
+        if path.exists():
+            return path
+        print(f"[WARN] HANDTRACK_CNN_WEIGHTS='{env_path}' ne postoji – koristim podrazumevani direktorijum.")
+
+    weights_dir = PARENT_DIR / "models" / "saved weights-labeled"
+    candidates = sorted(weights_dir.glob("*.pth"))
+    if candidates:
+        return candidates[-1]
+
+    raise FileNotFoundError(
+        "Nisu pronađene CNN težine. Postavi HANDTRACK_CNN_WEIGHTS ili ubaci .pth u models/saved weights-labeled."
+    )
+
+
+MODEL_PATH = resolve_model_path()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 cnn_model = CNN().to(device)
@@ -101,6 +185,7 @@ def segment_letters(word_img_path):
     max_w, max_h = int(0.9 * img_w), int(0.9 * img_h)
     letter_idx = 1
     recognized_letters = []
+    display_letters: List[np.ndarray] = []
     for (x, y, w, h) in boxes:
         if w < min_w or h < min_h:
             continue
@@ -114,11 +199,14 @@ def segment_letters(word_img_path):
         letter_img = img[y1:y2, x1:x2]
         letter_gray = cv2.cvtColor(letter_img, cv2.COLOR_BGR2GRAY)
         _, letter_bin = cv2.threshold(letter_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        letter_resized = cv2.resize(letter_bin, (28, 28), interpolation=cv2.INTER_AREA)
+        letter_resized = resize_with_padding(letter_bin, size=28, margin=2)
         letter_path = os.path.join(letters_dir, f"letter_{letter_idx}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png")
         cv2.imwrite(letter_path, letter_resized)
         print(f"[DEBUG] Sačuvano slovo: {letter_path}")
-        # ovde cnn provaljuje slova
+        # čuvamo svaku sliku u BGR formatu za kasniji pregled
+        letter_display = cv2.cvtColor(letter_resized, cv2.COLOR_GRAY2BGR)
+        display_letters.append(letter_display)
+        # ovde CNN prepoznaje slovo
         try:
             tensor = torch.tensor(letter_resized, dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 255.0
             tensor = tensor.to(device)
@@ -133,12 +221,28 @@ def segment_letters(word_img_path):
             print(f"[ERROR] Greška u prepoznavanju slova: {e}")
         letter_idx += 1
     if recognized_letters:
-        word = ''.join(recognized_letters)
-        print(f"[WORD] Prepoznata reč: {word}")
-        global recognized_text
+        word_raw = ''.join(recognized_letters)
+        print(f"[WORD] Prepoznata reč: {word_raw}")
+        global recognized_text, recognized_history, last_recognized_display
+        debug_letter_images.clear()
+        debug_letter_images.extend(display_letters)
+        display_entry = word_raw
+        if correct_word is not None:
+            word_for_lm = word_raw.lower()
+            try:
+                corrected_word = correct_word(word_for_lm, recognized_history).lower()
+            except Exception as lm_exc:
+                print(f"[LANG] Greška pri korekciji: {lm_exc}")
+                corrected_word = word_for_lm
+            recognized_history.append(corrected_word)
+            if corrected_word != word_for_lm:
+                display_entry = f"{word_raw} ({corrected_word})"
+                print(f"[LANG] Korigovana reč: {display_entry}")
+
         if recognized_text:
             recognized_text += " "
-        recognized_text += word
+        recognized_text += display_entry
+        last_recognized_display = display_entry
 
 
 def merge_letter_boxes(boxes, x_thresh=30, y_thresh=20):
@@ -235,6 +339,105 @@ def draw_text_bubble(img, text, max_width=900, max_lines=4, font=cv2.FONT_HERSHE
         cv2.putText(img, line, (x_text, y_text), font, font_scale, text_color, font_thickness, cv2.LINE_AA)
         y_text += h + line_spacing
 
+
+def build_letters_grid(letters: List[np.ndarray]) -> Optional[np.ndarray]:
+    if not letters:
+        return None
+    cols = max(1, LETTER_GRID_COLS)
+    rows = math.ceil(len(letters) / cols)
+    tile = LETTER_TILE
+    margin = LETTER_MARGIN
+    grid_h = rows * tile + (rows + 1) * margin
+    grid_w = cols * tile + (cols + 1) * margin
+    grid = np.full((grid_h, grid_w, 3), 30, dtype=np.uint8)
+    for idx, letter in enumerate(letters):
+        r = idx // cols
+        c = idx % cols
+        y = margin + r * (tile + margin)
+        x = margin + c * (tile + margin)
+        resized = cv2.resize(letter, (tile, tile), interpolation=cv2.INTER_NEAREST)
+        grid[y:y + tile, x:x + tile] = resized
+    return grid
+
+
+def wrap_text(text: str, max_width: int) -> List[str]:
+    if not text:
+        return []
+    words = text.split()
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = (current + " " + word).strip()
+        (w, _), _ = cv2.getTextSize(candidate, UI_FONT, UI_FONT_SCALE, UI_FONT_THICKNESS)
+        if w > max_width and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def build_ui_panel(
+    height: int,
+    recognized_text: str,
+    last_word: str,
+    letters_grid: Optional[np.ndarray],
+    word_count: int,
+) -> np.ndarray:
+    panel = np.full((height, UI_PANEL_WIDTH, 3), UI_BG_COLOR, dtype=np.uint8)
+    y = UI_SECTION_MARGIN + 5
+
+    def draw_title(text: str, ypos: int, color=UI_ACCENT_COLOR):
+        clean = normalize_text(text)
+        cv2.putText(panel, clean, (16, ypos), UI_FONT, 0.7, color, 2, cv2.LINE_AA)
+        return ypos + 8
+
+    def draw_lines(lines: List[str], ypos: int):
+        for line in lines:
+            clean = normalize_text(line)
+            cv2.putText(panel, clean, (16, ypos), UI_FONT, UI_FONT_SCALE, UI_TEXT_COLOR, UI_FONT_THICKNESS, cv2.LINE_AA)
+            ypos += 20
+        return ypos
+
+    y = draw_title("Air Writing status", y)
+    y += 12
+    stats_lines = [
+        normalize_text(f"Sačuvanih reči: {max(0, word_count - 1)}"),
+    ]
+    if last_word:
+        stats_lines.append(normalize_text(f"Poslednja reč: {last_word}"))
+    y = draw_lines(stats_lines, y)
+
+    y += UI_SECTION_MARGIN
+    y = draw_title("Prepoznati tekst", y)
+    y += 12
+    text_lines = wrap_text(normalize_text(recognized_text), UI_PANEL_WIDTH - 32)
+    if not text_lines:
+        text_lines = ["(čekam na unos)"]
+    y = draw_lines(text_lines, y)
+
+    if letters_grid is not None:
+        y += UI_SECTION_MARGIN
+        y = draw_title("Segmentisana slova", y)
+        y += 12
+        grid_max_width = UI_PANEL_WIDTH - 32
+        scale = min(1.0, grid_max_width / letters_grid.shape[1])
+        grid_resized = cv2.resize(letters_grid, (int(letters_grid.shape[1] * scale), int(letters_grid.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+        h, w = grid_resized.shape[:2]
+        if y + h + 10 > height - 100:
+            y = height - 100 - h
+            y = max(y, UI_SECTION_MARGIN)
+        panel[y:y + h, 16:16 + w] = grid_resized
+        y += h + 10
+
+    y = max(y + 10, height - 90)
+    y = draw_title("Kontrole", y)
+    y += 12
+    y = draw_lines(UI_INSTRUCTIONS, y)
+    return panel
+
 with mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
@@ -310,12 +513,15 @@ with mp_hands.Hands(
         # Prikaz prepoznatog teksta na ekranu
         if recognized_text:
             draw_text_bubble(img_out, recognized_text)
-        cv2.imshow('MediaPipe Hands', img_out)
+        letters_grid = build_letters_grid(debug_letter_images)
+        panel = build_ui_panel(img_out.shape[0], recognized_text, last_recognized_display, letters_grid, word_count)
+        dashboard = np.hstack((img_out, panel))
+        cv2.imshow('Air Writing demonstrator', dashboard)
 
         if cv2.waitKey(1) & 0xFF == 27:
             break
         # Izađi ako je prozor zatvoren (klik na X)
-        if cv2.getWindowProperty('MediaPipe Hands', cv2.WND_PROP_VISIBLE) < 1:
+        if cv2.getWindowProperty('Air Writing demonstrator', cv2.WND_PROP_VISIBLE) < 1:
             break
 cap.release()
 cv2.destroyAllWindows()
