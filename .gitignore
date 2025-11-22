@@ -1,8 +1,17 @@
 .venv/
+.venv311/
 Writing_part/venv/
 Writing_part/slova/
 Writing_part/data/
 __pycache__/
+*.pyc
+models/language_model/__pycache__/
+distance_penalty*.png
+language_model_*.csv
+/models/yolo/best.pt
+/models/yolo/yolo_dataset/
+/models/yolo/yolo_dataset.zip
+/models/yolo/yolo.ipynb
 /home/mihailo/Documents/projects/lk-s-2025-air-writing/models/emnist-letters-train.csv
 dataset/emnist-letters-train.csv
 models/emnist-letters-train.csv
@@ -11,4 +20,7 @@ models/weights-convolutional 1/
 dataset/emnist-letters-train-transformed.csv
 models/emnist-letters-test-transformed.csv
 models/saved weights-labeled/3. sa 3. transformisani dataset 1 model_epoch_9_20250630_125703.pth
-models/saved weights-labeled/4. sa 3. sloja transformisani dataset 93.% tacnost model_epoch_15_20250630_125703.pth
+checkpoints/
+logs/
+reports/
+models/training_runs/
