@@ -6,7 +6,6 @@ Writing_part/data/
 __pycache__/
 *.pyc
 models/language_model/__pycache__/
-/models/language_model/artifacts/
 distance_penalty*.png
 language_model_*.csv
 /models/yolo/best.pt
@@ -21,10 +20,7 @@ models/weights-convolutional 1/
 dataset/emnist-letters-train-transformed.csv
 models/emnist-letters-test-transformed.csv
 models/saved weights-labeled/3. sa 3. transformisani dataset 1 model_epoch_9_20250630_125703.pth
-models/saved weights-labeled/4. sa 3. sloja transformisani dataset 93.% tacnost model_epoch_15_20250630_125703.pth
 checkpoints/
 logs/
 reports/
 models/training_runs/
-config/
-models/language_model/

@@ -1,0 +1,17 @@
+# Language model configuration
+
+language: en
+artifacts_dir: models/language_model/artifacts
+
+# filtering
+min_frequency_zipf: 3.0  # ignorisu se reci ispod ove vrednosti
+
+# candidate selection
+max_edit_distance: 2
+top_k_candidates: 5
+
+# scoring
+distance_penalty: 1.0
+
+# bigram (zahteva bigrams_en.json)
+use_bigrams: false

@@ -27,6 +27,10 @@ recognized_history: List[str] = []  # Čuvanje reči za potrebe LM-a kada je dos
 debug_letter_images: List[np.ndarray] = []  # Slike svih slova poslednje segmentisane reči
 last_recognized_display: str = ""
 
+# Normalizacija - iste vrednosti kao u treningu (models/data.py)
+NORMALIZE_MEAN = 0.1736
+NORMALIZE_STD = 0.3249
+
 LETTER_GRID_COLS = 8
 LETTER_TILE = 56
 LETTER_MARGIN = 6
@@ -209,6 +213,7 @@ def segment_letters(word_img_path):
         # ovde CNN prepoznaje slovo
         try:
             tensor = torch.tensor(letter_resized, dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 255.0
+            tensor = (tensor - NORMALIZE_MEAN) / NORMALIZE_STD  # ista normalizacija kao u treningu
             tensor = tensor.to(device)
             with torch.no_grad():
                 output = cnn_model(tensor)
