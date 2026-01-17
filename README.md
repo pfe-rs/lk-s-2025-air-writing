@@ -12,6 +12,9 @@ Real-time handwritten letter recognition using hand gestures captured via webcam
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 
+
+
+📄 [Technical Report (PDF)](Project_report.pdf)
 ## Installation
 
 Requirements: Python 3.10+, webcam
