@@ -1,6 +1,9 @@
 .venv/
+.venv_win/
 .venv311/
 Writing_part/venv/
+Writing_part/hand_landmarker.task
+.vscode/
 Writing_part/slova/
 Writing_part/data/
 __pycache__/

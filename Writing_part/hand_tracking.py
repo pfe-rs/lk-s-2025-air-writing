@@ -34,7 +34,7 @@ NORMALIZE_STD = 0.3249
 LETTER_GRID_COLS = 8
 LETTER_TILE = 56
 LETTER_MARGIN = 6
-UI_PANEL_WIDTH = 360
+UI_PANEL_WIDTH = 380
 UI_BG_COLOR = (24, 24, 24)
 UI_TEXT_COLOR = (230, 230, 230)
 UI_ACCENT_COLOR = (0, 180, 255)
@@ -50,17 +50,50 @@ ACCENT_MAP = str.maketrans({
     "ä": "a", "ö": "o", "ü": "u", "ß": "ss",
 })
 UI_INSTRUCTIONS_RAW = [
-    "Gest 1: Kažiprst = crtanje",
-    "Gest 2: Svi prsti = gumica",
-    "Gest 3: Kažiprst + mali = segment reči",
-    "ESC: izlaz iz demonstracije",
+    "Index finger      ->  Draw",
+    "All fingers       ->  Erase",
+    "Index + pinky     ->  Commit word",
+    "ESC               ->  Exit",
 ]
+
+# Dugme za brisanje
+BUTTON_X = 16
+BUTTON_Y = 0  # postavlja se dinamicki u build_ui_panel
+BUTTON_W = 120
+BUTTON_H = 32
+BUTTON_COLOR = (60, 60, 180)
+BUTTON_HOVER_COLOR = (80, 80, 220)
+BUTTON_TEXT = "Clear All"
+button_rect = {"x": 0, "y": 0, "w": BUTTON_W, "h": BUTTON_H}  # globalno za mouse callback
+button_hovered = False
 
 def normalize_text(text: str) -> str:
     return text.translate(ACCENT_MAP)
 
 
 UI_INSTRUCTIONS = [normalize_text(line) for line in UI_INSTRUCTIONS_RAW]
+
+
+def clear_all():
+    """Obriši sve - canvas, prepoznati tekst, istoriju."""
+    global recognized_text, recognized_history, debug_letter_images, last_recognized_display, canvas, word_count
+    recognized_text = ""
+    recognized_history.clear()
+    debug_letter_images.clear()
+    last_recognized_display = ""
+    canvas = None
+    word_count = 1
+    print("[DEBUG] Sve obrisano!")
+
+
+def mouse_callback(event, x, y, flags, param):
+    """Callback za klik misa - proverava da li je kliknuto na dugme."""
+    global button_hovered
+    bx, by = button_rect["x"], button_rect["y"]
+    bw, bh = button_rect["w"], button_rect["h"]
+    button_hovered = bx <= x <= bx + bw and by <= y <= by + bh
+    if event == cv2.EVENT_LBUTTONDOWN and button_hovered:
+        clear_all()
 
 
 def resize_with_padding(img, size=28, margin=2):
@@ -276,8 +309,29 @@ def merge_letter_boxes(boxes, x_thresh=30, y_thresh=20):
         merged.append(tuple(box))
     return merged
 
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
+_HAND_MODEL = Path(__file__).parent / "hand_landmarker.task"
+if not _HAND_MODEL.exists():
+    import urllib.request
+    print("[INFO] Preuzimanje modela za detekciju ruke...")
+    urllib.request.urlretrieve(
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        _HAND_MODEL,
+    )
+    print("[INFO] Model preuzet.")
+
+_HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
+    (5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),
+    (13,17),(17,18),(18,19),(19,20),(0,17),
+]
+
+def _draw_landmarks(image, landmarks):
+    h, w = image.shape[:2]
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    for a, b in _HAND_CONNECTIONS:
+        cv2.line(image, pts[a], pts[b], (0, 255, 0), 2)
+    for pt in pts:
+        cv2.circle(image, pt, 4, (0, 0, 255), -1)
 
 cap = cv2.VideoCapture(0)
 canvas = None
@@ -390,65 +444,103 @@ def build_ui_panel(
     last_word: str,
     letters_grid: Optional[np.ndarray],
     word_count: int,
+    video_width: int = 0,
 ) -> np.ndarray:
     panel = np.full((height, UI_PANEL_WIDTH, 3), UI_BG_COLOR, dtype=np.uint8)
-    y = UI_SECTION_MARGIN + 5
+    PAD = 20
 
-    def draw_title(text: str, ypos: int, color=UI_ACCENT_COLOR):
-        clean = normalize_text(text)
-        cv2.putText(panel, clean, (16, ypos), UI_FONT, 0.7, color, 2, cv2.LINE_AA)
-        return ypos + 8
+    # ── Header bar ────────────────────────────────────────────────────────────
+    HEADER_H = 46
+    cv2.rectangle(panel, (0, 0), (UI_PANEL_WIDTH, HEADER_H), UI_ACCENT_COLOR, -1)
+    hdr = "AIR WRITING SYSTEM"
+    (hw, hh), _ = cv2.getTextSize(hdr, UI_FONT, 0.6, 2)
+    cv2.putText(panel, hdr, ((UI_PANEL_WIDTH - hw) // 2, (HEADER_H + hh) // 2),
+                UI_FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
-    def draw_lines(lines: List[str], ypos: int):
+    y = HEADER_H + 18
+
+    def separator(ypos: int) -> int:
+        cv2.line(panel, (PAD, ypos), (UI_PANEL_WIDTH - PAD, ypos), (50, 50, 50), 1)
+        return ypos + 14
+
+    def section_label(text: str, ypos: int) -> int:
+        label = normalize_text(text.upper())
+        cv2.rectangle(panel, (PAD, ypos - 9), (PAD + 2, ypos + 3), UI_ACCENT_COLOR, -1)
+        cv2.putText(panel, label, (PAD + 8, ypos),
+                    UI_FONT, 0.42, UI_ACCENT_COLOR, 1, cv2.LINE_AA)
+        return ypos + 14
+
+    def body_lines(lines: List[str], ypos: int) -> int:
         for line in lines:
-            clean = normalize_text(line)
-            cv2.putText(panel, clean, (16, ypos), UI_FONT, UI_FONT_SCALE, UI_TEXT_COLOR, UI_FONT_THICKNESS, cv2.LINE_AA)
-            ypos += 20
+            cv2.putText(panel, normalize_text(line), (PAD + 4, ypos),
+                        UI_FONT, UI_FONT_SCALE, UI_TEXT_COLOR, UI_FONT_THICKNESS, cv2.LINE_AA)
+            ypos += 19
         return ypos
 
-    y = draw_title("Air Writing status", y)
-    y += 12
-    stats_lines = [
-        normalize_text(f"Sačuvanih reči: {max(0, word_count - 1)}"),
-    ]
+    # ── Status ────────────────────────────────────────────────────────────────
+    y = section_label("Status", y)
+    stats = [f"Words committed:  {max(0, word_count - 1)}"]
     if last_word:
-        stats_lines.append(normalize_text(f"Poslednja reč: {last_word}"))
-    y = draw_lines(stats_lines, y)
+        stats.append(f"Last word:  {last_word}")
+    y = body_lines(stats, y)
 
-    y += UI_SECTION_MARGIN
-    y = draw_title("Prepoznati tekst", y)
-    y += 12
-    text_lines = wrap_text(normalize_text(recognized_text), UI_PANEL_WIDTH - 32)
-    if not text_lines:
-        text_lines = ["(čekam na unos)"]
-    y = draw_lines(text_lines, y)
+    # ── Recognized text ───────────────────────────────────────────────────────
+    y = separator(y + 8)
+    y = section_label("Recognized Text", y)
+    r_lines = wrap_text(normalize_text(recognized_text), UI_PANEL_WIDTH - PAD * 2 - 8)
+    y = body_lines(r_lines if r_lines else ["--"], y)
 
+    # ── Segmented letters ─────────────────────────────────────────────────────
     if letters_grid is not None:
-        y += UI_SECTION_MARGIN
-        y = draw_title("Segmentisana slova", y)
-        y += 12
-        grid_max_width = UI_PANEL_WIDTH - 32
-        scale = min(1.0, grid_max_width / letters_grid.shape[1])
-        grid_resized = cv2.resize(letters_grid, (int(letters_grid.shape[1] * scale), int(letters_grid.shape[0] * scale)), interpolation=cv2.INTER_AREA)
-        h, w = grid_resized.shape[:2]
-        if y + h + 10 > height - 100:
-            y = height - 100 - h
-            y = max(y, UI_SECTION_MARGIN)
-        panel[y:y + h, 16:16 + w] = grid_resized
-        y += h + 10
+        y = separator(y + 8)
+        y = section_label("Segmented Letters", y)
+        gmax_w = UI_PANEL_WIDTH - PAD * 2
+        scale = min(1.0, gmax_w / letters_grid.shape[1])
+        gw = int(letters_grid.shape[1] * scale)
+        gh = int(letters_grid.shape[0] * scale)
+        grid_r = cv2.resize(letters_grid, (gw, gh), interpolation=cv2.INTER_AREA)
+        if y + gh > height - 155:
+            y = max(height - 155 - gh, HEADER_H + 18)
+        panel[y:y + gh, PAD:PAD + gw] = grid_r
+        y += gh + 8
 
-    y = max(y + 10, height - 90)
-    y = draw_title("Kontrole", y)
-    y += 12
-    y = draw_lines(UI_INSTRUCTIONS, y)
+    # ── Controls ──────────────────────────────────────────────────────────────
+    ctrl_y = max(y + 8, height - 168)
+    ctrl_y = separator(ctrl_y)
+    ctrl_y = section_label("Controls", ctrl_y)
+    body_lines(UI_INSTRUCTIONS, ctrl_y)
+
+    # ── Clear button ──────────────────────────────────────────────────────────
+    btn_y = height - 46
+    btn_x = PAD
+    btn_w = UI_PANEL_WIDTH - PAD * 2
+    btn_color = BUTTON_HOVER_COLOR if button_hovered else BUTTON_COLOR
+    cv2.rectangle(panel, (btn_x, btn_y), (btn_x + btn_w, btn_y + BUTTON_H), btn_color, -1)
+    cv2.rectangle(panel, (btn_x, btn_y), (btn_x + btn_w, btn_y + BUTTON_H), UI_ACCENT_COLOR, 1)
+    lbl = normalize_text(BUTTON_TEXT)
+    (lw, lh), _ = cv2.getTextSize(lbl, UI_FONT, 0.52, 1)
+    cv2.putText(panel, lbl, (btn_x + (btn_w - lw) // 2, btn_y + (BUTTON_H + lh) // 2),
+                UI_FONT, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+    button_rect["x"] = video_width + btn_x
+    button_rect["y"] = btn_y
+    button_rect["w"] = btn_w
+    button_rect["h"] = BUTTON_H
+
     return panel
 
-with mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-) as hands:
+_options = mp.tasks.vision.HandLandmarkerOptions(
+    base_options=mp.tasks.BaseOptions(model_asset_path=str(_HAND_MODEL)),
+    running_mode=mp.tasks.vision.RunningMode.VIDEO,
+    num_hands=1,
+    min_hand_detection_confidence=0.5,
+    min_hand_presence_confidence=0.5,
+    min_tracking_confidence=0.5,
+)
+cv2.namedWindow('Air Writing System')
+cv2.setMouseCallback('Air Writing System', mouse_callback)
+
+with mp.tasks.vision.HandLandmarker.create_from_options(_options) as hands:
     prev_point = None
     font = cv2.FONT_HERSHEY_SIMPLEX
     gesture_word_prev = False  # Da li je prethodni frejm bio gest za reč
@@ -459,20 +551,18 @@ with mp_hands.Hands(
         frame = cv2.flip(frame, 1)
         if canvas is None or canvas.shape != frame.shape:
             canvas = np.zeros_like(frame)
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(image)
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        results = hands.detect_for_video(mp_image, int(cap.get(cv2.CAP_PROP_POS_MSEC)))
+        image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         draw = False
         erase = False
         eraser_center = None
         gesture_word = False  # Da li je detektovan gest za reč
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(
-                    image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                lm = hand_landmarks.landmark
+        if results.hand_landmarks:
+            for lm in results.hand_landmarks:
+                _draw_landmarks(image, lm)
                 fingers = fingers_up(lm)
-                print(f"[DEBUG] Fingers: {fingers}")
                 # Ako je podignut samo kažiprst, crtamo
                 if fingers[1] and not fingers[2] and not fingers[3] and not fingers[4]:
                     draw = True
@@ -484,7 +574,7 @@ with mp_hands.Hands(
                 # Ako su svi prsti (osim palca) podignuti, koristi se gumica
                 elif all(fingers[1:]):
                     erase = True
-                    eraser_center = (int(lm[0].x * frame.shape[1]), int(lm[0].y * frame.shape[0]))
+                    eraser_center = (int(lm[9].x * frame.shape[1]), int(lm[9].y * frame.shape[0]))
                     prev_point = None
                 else:
                     # Ako se prestane sa crtanjem, resetuj prev_point
@@ -515,18 +605,30 @@ with mp_hands.Hands(
             cv2.circle(image, eraser_center, 40, (0, 255, 255), 2)
         # Kombinuj originalni snimak i platno da bi se videlo šta je nacrtano
         img_out = cv2.addWeighted(image, 0.5, canvas, 0.5, 0)
-        # Prikaz prepoznatog teksta na ekranu
-        if recognized_text:
-            draw_text_bubble(img_out, recognized_text)
+        # Indikator aktivnog gesta (donji levi ugao kamere)
+        if draw:
+            _badge, _badge_col = "DRAW", (0, 180, 255)
+        elif erase:
+            _badge, _badge_col = "ERASE", (0, 210, 80)
+        elif gesture_word:
+            _badge, _badge_col = "COMMIT", (255, 160, 0)
+        else:
+            _badge, _badge_col = "", (0, 0, 0)
+        if _badge:
+            (_bw, _bh), _ = cv2.getTextSize(_badge, UI_FONT, 0.62, 2)
+            _bx, _by = 12, img_out.shape[0] - 14
+            cv2.rectangle(img_out, (_bx - 8, _by - _bh - 8), (_bx + _bw + 8, _by + 6), (20, 20, 20), -1)
+            cv2.rectangle(img_out, (_bx - 8, _by - _bh - 8), (_bx + _bw + 8, _by + 6), _badge_col, 1)
+            cv2.putText(img_out, _badge, (_bx, _by), UI_FONT, 0.62, _badge_col, 2, cv2.LINE_AA)
         letters_grid = build_letters_grid(debug_letter_images)
-        panel = build_ui_panel(img_out.shape[0], recognized_text, last_recognized_display, letters_grid, word_count)
+        panel = build_ui_panel(img_out.shape[0], recognized_text, last_recognized_display, letters_grid, word_count, img_out.shape[1])
         dashboard = np.hstack((img_out, panel))
-        cv2.imshow('Air Writing demonstrator', dashboard)
+        cv2.imshow('Air Writing System', dashboard)
 
         if cv2.waitKey(1) & 0xFF == 27:
             break
         # Izađi ako je prozor zatvoren (klik na X)
-        if cv2.getWindowProperty('Air Writing demonstrator', cv2.WND_PROP_VISIBLE) < 1:
+        if cv2.getWindowProperty('Air Writing System', cv2.WND_PROP_VISIBLE) < 1:
             break
 cap.release()
 cv2.destroyAllWindows()
