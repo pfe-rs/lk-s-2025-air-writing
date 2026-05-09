@@ -7,9 +7,18 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 import math
+import json
+import re
+import time as _time
+import random
+from itertools import groupby
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+"""
+ & c:/Users/mihai/Documents/projects/lk-s-2025-air-writing/.venv_win/Scripts/python.exe c:/Users/mihai/Documents/projects/lk-s-2025-air-writing/Writing_part/hand_tracking.py
+"""
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PARENT_DIR = CURRENT_DIR.parent
@@ -22,10 +31,72 @@ except ImportError:
     # Jezički model nije dostupan – radićemo bez korekcije.
     correct_word = None  # type: ignore
 
-recognized_text = ""  # Globalna promenljiva za prikaz prepoznatog teksta
-recognized_history: List[str] = []  # Čuvanje reči za potrebe LM-a kada je dostupan
-debug_letter_images: List[np.ndarray] = []  # Slike svih slova poslednje segmentisane reči
+recognized_text = ""
+recognized_history: List[str] = []
+debug_letter_images: List[np.ndarray] = []
 last_recognized_display: str = ""
+
+# ── Game mode state ───────────────────────────────────────────────────────────
+"""
+GAME_WORDS = [
+    "apple", "brave", "cloud", "dance", "eagle",
+    "flame", "grace", "heart", "input", "joker",
+    "knife", "lemon", "magic", "nerve", "ocean",
+    "piano", "quiet", "river", "stone", "tiger",
+    "ultra", "vivid", "water", "xenon", "yacht",
+"""
+GAME_WORDS = [
+    "heart",
+]
+LEADERBOARD_PATH = CURRENT_DIR / "leaderboard.json"
+LEADERBOARD_TOP_N = 5
+
+game_mode: bool = False
+# states: "nickname" | "ready" | "writing" | "result"
+game_state: str = "nickname"
+game_nickname: str = ""
+game_nickname_input: str = ""       # buffer while user types
+game_target_word: str = ""
+game_start_time: float = 0.0
+game_result_time: float = 0.0
+game_result_recognized: str = ""
+game_result_match: bool = False
+game_thumbs_prev: bool = False
+game_session_results: List[dict] = []   # results for current word/session
+
+
+def load_leaderboard() -> List[dict]:
+    if LEADERBOARD_PATH.exists():
+        try:
+            with open(LEADERBOARD_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def save_leaderboard(lb: List[dict]) -> None:
+    with open(LEADERBOARD_PATH, "w") as f:
+        json.dump(lb, f, indent=2)
+
+
+def add_to_leaderboard(name: str, word: str, elapsed: float) -> List[dict]:
+    lb = load_leaderboard()
+    lb.append({"name": name, "word": word, "time": round(elapsed, 2)})
+    # keep top 20 entries *per word* independently
+    grouped: List[dict] = []
+    for w, entries in groupby(sorted(lb, key=lambda e: e["word"]), key=lambda e: e["word"]):
+        word_entries = sorted(entries, key=lambda e: e["time"])[:20]
+        grouped.extend(word_entries)
+    save_leaderboard(grouped)
+    return grouped
+
+
+def thumbs_up(lm) -> bool:
+    """Thumb tip above thumb base, all other fingers curled."""
+    thumb_up = lm[4].y < lm[2].y
+    others_down = all(lm[tip].y > lm[tip - 2].y for tip in [8, 12, 16, 20])
+    return thumb_up and others_down
 
 # Normalizacija - iste vrednosti kao u treningu (models/data.py)
 NORMALIZE_MEAN = 0.1736
@@ -349,11 +420,14 @@ word_count = 1  # Broj reči koje su sačuvane
 
 
 
-def fingers_up(landmarks):
+def fingers_up(landmarks, is_right: bool = True):
     tips = [4, 8, 12, 16, 20]  # indeksi vrhova prstiju: palac, kažiprst, srednji, domali, mali
     fingers = []
-    # Palac (proverava da li je vrh desno od zgloba)
-    fingers.append(landmarks[4].x > landmarks[3].x)
+    # Palac: smer zavisi od toga koja je ruka (nakon flipa slike)
+    if is_right:
+        fingers.append(landmarks[4].x > landmarks[3].x)
+    else:
+        fingers.append(landmarks[4].x < landmarks[3].x)
     # Ostali prsti (proverava da li je vrh iznad zgloba)
     for tip in tips[1:]:
         fingers.append(landmarks[tip].y < landmarks[tip - 2].y)
@@ -529,6 +603,126 @@ def build_ui_panel(
 
     return panel
 
+def build_game_panel(height: int) -> np.ndarray:
+    panel = np.full((height, UI_PANEL_WIDTH, 3), (18, 18, 18), dtype=np.uint8)
+    PAD = 20
+
+    # Header
+    HEADER_H = 46
+    cv2.rectangle(panel, (0, 0), (UI_PANEL_WIDTH, HEADER_H), (180, 80, 0), -1)
+    hdr = "GAME MODE"
+    (hw, hh), _ = cv2.getTextSize(hdr, UI_FONT, 0.6, 2)
+    cv2.putText(panel, hdr, ((UI_PANEL_WIDTH - hw) // 2, (HEADER_H + hh) // 2),
+                UI_FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+    y = HEADER_H + 22
+
+    def line(text, ypos, scale=0.5, color=(220, 220, 220), thickness=1):
+        cv2.putText(panel, normalize_text(text), (PAD, ypos),
+                    UI_FONT, scale, color, thickness, cv2.LINE_AA)
+        return ypos + int(scale * 46) + 4
+
+    def separator(ypos):
+        cv2.line(panel, (PAD, ypos), (UI_PANEL_WIDTH - PAD, ypos), (50, 50, 50), 1)
+        return ypos + 14
+
+    if game_state == "nickname":
+        y = line("Enter your nickname:", y, 0.52, (180, 180, 180))
+        y += 6
+        box_y = y
+        cv2.rectangle(panel, (PAD, box_y), (UI_PANEL_WIDTH - PAD, box_y + 34), (40, 40, 40), -1)
+        cv2.rectangle(panel, (PAD, box_y), (UI_PANEL_WIDTH - PAD, box_y + 34), (0, 180, 255), 1)
+        display = game_nickname_input + "|"
+        cv2.putText(panel, display, (PAD + 8, box_y + 23),
+                    UI_FONT, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        y = box_y + 46
+        y = line("Press ENTER to confirm.", y, 0.45, (120, 120, 120))
+
+    elif game_state == "ready":
+        y = line(f"Player:  {game_nickname}", y, 0.52, (0, 200, 120))
+        y += 8
+        y = separator(y)
+        y = line("Write this word:", y, 0.52, (180, 180, 180))
+        y += 4
+        (ww, wh), _ = cv2.getTextSize(game_target_word.upper(), UI_FONT, 1.1, 2)
+        cv2.putText(panel, game_target_word.upper(),
+                    ((UI_PANEL_WIDTH - ww) // 2, y + wh + 4),
+                    UI_FONT, 1.1, (0, 180, 255), 2, cv2.LINE_AA)
+        y += wh + 22
+        y = separator(y)
+        y = line("Thumbs up  ->  Start timer", y, 0.47, (200, 200, 200))
+        y = line("Index+pinky ->  Commit", y, 0.47, (200, 200, 200))
+
+    elif game_state == "writing":
+        elapsed = _time.time() - game_start_time
+        y = line(f"Player:  {game_nickname}", y, 0.52, (0, 200, 120))
+        y += 4
+        y = separator(y)
+        y = line("Write:", y, 0.5, (180, 180, 180))
+        (ww, wh), _ = cv2.getTextSize(game_target_word.upper(), UI_FONT, 1.1, 2)
+        cv2.putText(panel, game_target_word.upper(),
+                    ((UI_PANEL_WIDTH - ww) // 2, y + wh + 4),
+                    UI_FONT, 1.1, (0, 255, 120), 2, cv2.LINE_AA)
+        y += wh + 20
+        y = separator(y)
+        # Stopwatch
+        timer_str = f"{elapsed:.2f}s"
+        (tw, th), _ = cv2.getTextSize(timer_str, UI_FONT, 1.3, 2)
+        cv2.putText(panel, timer_str,
+                    ((UI_PANEL_WIDTH - tw) // 2, y + th + 6),
+                    UI_FONT, 1.3, (0, 180, 255), 2, cv2.LINE_AA)
+        y += th + 22
+        y = line("Index+pinky  ->  Commit", y, 0.45, (160, 160, 160))
+
+    elif game_state == "result":
+        y = line(f"Player:  {game_nickname}", y, 0.52, (0, 200, 120))
+        y += 4
+        y = separator(y)
+        y = line(f"Target:      {game_target_word}", y, 0.5, (180, 180, 180))
+        y = line(f"Recognized:  {game_result_recognized}", y, 0.5, (180, 180, 180))
+        result_color = (0, 220, 80) if game_result_match else (0, 60, 220)
+        result_label = "CORRECT!" if game_result_match else "WRONG"
+        (rw, rh), _ = cv2.getTextSize(result_label, UI_FONT, 0.9, 2)
+        cv2.putText(panel, result_label,
+                    ((UI_PANEL_WIDTH - rw) // 2, y + rh + 6),
+                    UI_FONT, 0.9, result_color, 2, cv2.LINE_AA)
+        y += rh + 14
+        if game_result_match:
+            time_str = f"Time: {game_result_time:.2f}s"
+            (tw, th), _ = cv2.getTextSize(time_str, UI_FONT, 0.8, 2)
+            cv2.putText(panel, time_str,
+                        ((UI_PANEL_WIDTH - tw) // 2, y + th + 4),
+                        UI_FONT, 0.8, (0, 180, 255), 2, cv2.LINE_AA)
+            y += th + 18
+            y = separator(y)
+            # Session standings — this round, same word
+            cv2.putText(panel, f"THIS ROUND  [{game_target_word.upper()}]",
+                        (PAD, y), UI_FONT, 0.45, (0, 180, 255), 1, cv2.LINE_AA)
+            y += 18
+            medals = ["1.", "2.", "3.", "4.", "5."]
+            for i, entry in enumerate(game_session_results[:LEADERBOARD_TOP_N]):
+                col = (0, 215, 100) if i == 0 else (180, 180, 180)
+                txt = f"{medals[i]} {entry['name']:<12} {entry['time']:.2f}s"
+                cv2.putText(panel, normalize_text(txt), (PAD + 4, y),
+                            UI_FONT, 0.47, col, 1, cv2.LINE_AA)
+                y += 18
+            y = separator(y + 4)
+            y = line("SPACE -> next player (same word)", y, 0.42, (140, 140, 140))
+            y = line("N     -> new word (new session)", y, 0.42, (140, 140, 140))
+            y = line("G     -> normal mode", y, 0.42, (140, 140, 140))
+        else:
+            y = separator(y)
+            y = line("SPACE -> try again", y, 0.42, (140, 140, 140))
+            y = line("N     -> next player (same word)", y, 0.42, (140, 140, 140))
+            y = line("G     -> normal mode", y, 0.42, (140, 140, 140))
+
+    # Footer hint
+    cv2.putText(panel, "G = toggle normal mode", (PAD, height - 12),
+                UI_FONT, 0.38, (70, 70, 70), 1, cv2.LINE_AA)
+
+    return panel
+
+
 _options = mp.tasks.vision.HandLandmarkerOptions(
     base_options=mp.tasks.BaseOptions(model_asset_path=str(_HAND_MODEL)),
     running_mode=mp.tasks.vision.RunningMode.VIDEO,
@@ -542,8 +736,7 @@ cv2.setMouseCallback('Air Writing System', mouse_callback)
 
 with mp.tasks.vision.HandLandmarker.create_from_options(_options) as hands:
     prev_point = None
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    gesture_word_prev = False  # Da li je prethodni frejm bio gest za reč
+    gesture_word_prev = False
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -551,19 +744,27 @@ with mp.tasks.vision.HandLandmarker.create_from_options(_options) as hands:
         frame = cv2.flip(frame, 1)
         if canvas is None or canvas.shape != frame.shape:
             canvas = np.zeros_like(frame)
+
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
         results = hands.detect_for_video(mp_image, int(cap.get(cv2.CAP_PROP_POS_MSEC)))
         image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
         draw = False
         erase = False
         eraser_center = None
-        gesture_word = False  # Da li je detektovan gest za reč
+        gesture_word = False
+        gesture_thumb = False
+
         if results.hand_landmarks:
-            for lm in results.hand_landmarks:
+            for i, lm in enumerate(results.hand_landmarks):
                 _draw_landmarks(image, lm)
-                fingers = fingers_up(lm)
-                # Ako je podignut samo kažiprst, crtamo
+                # After cv2.flip, mediapipe "Left" = user's right hand, "Right" = user's left hand
+                handedness_label = results.handedness[i][0].category_name if results.handedness else "Left"
+                is_right = (handedness_label == "Left")
+                fingers = fingers_up(lm, is_right)
+                gesture_thumb = thumbs_up(lm)
+
                 if fingers[1] and not fingers[2] and not fingers[3] and not fingers[4]:
                     draw = True
                     x = int(lm[8].x * frame.shape[1])
@@ -571,47 +772,65 @@ with mp.tasks.vision.HandLandmarker.create_from_options(_options) as hands:
                     if prev_point is not None:
                         cv2.line(canvas, prev_point, (x, y), (0, 0, 255), 8)
                     prev_point = (x, y)
-                # Ako su svi prsti (osim palca) podignuti, koristi se gumica
                 elif all(fingers[1:]):
                     erase = True
                     eraser_center = (int(lm[9].x * frame.shape[1]), int(lm[9].y * frame.shape[0]))
                     prev_point = None
                 else:
-                    # Ako se prestane sa crtanjem, resetuj prev_point
                     prev_point = None
-                # Ako su podignuti kažiprst i mali prst, a palac dole onda je     reč
+
                 if fingers[1] and not fingers[0] and not fingers[2] and not fingers[3] and fingers[4]:
                     gesture_word = True
         else:
             prev_point = None
-        # Sačuvaj
+
+        # ── Commit gesture (shared by normal + game writing state) ───────────
         if gesture_word and not gesture_word_prev:
-            # Proveri da li na platnu ima crteža (da nije prazno)
             if np.any(canvas != 0):
                 saved = save_word_image(canvas, data_dir, word_count)
                 if saved:
                     word_count += 1
-                    print(f"[DEBUG] Reč sačuvana, word_count: {word_count}")
-                else:
-                    print("[DEBUG] Reč nije sačuvana!")
+                    if game_mode and game_state == "writing":
+                        game_result_time = _time.time() - game_start_time
+                        # last_recognized_display is either "word" or "word (corrected)"
+                        # prefer the corrected form for comparison
+                        _disp = last_recognized_display if last_recognized_display else "?"
+                        _m = re.search(r'\(([^)]+)\)', _disp)
+                        game_result_recognized = _m.group(1) if _m else _disp.split()[0]
+                        game_result_match = game_result_recognized.strip().lower() == game_target_word.strip().lower()
+                        if game_result_match:
+                            add_to_leaderboard(game_nickname, game_target_word, game_result_time)
+                            game_session_results.append({"name": game_nickname, "time": game_result_time})
+                            game_session_results.sort(key=lambda e: e["time"])
+                        game_state = "result"
                 canvas = np.zeros_like(frame)
                 prev_point = None
-            else:
-                print("[DEBUG] Preskočeno čuvanje prazne slike!")
         gesture_word_prev = gesture_word
-        # Gumica
+
+        # ── Game mode: thumbs-up starts the timer ────────────────────────────
+        if game_mode and game_state == "ready":
+            if gesture_thumb and not game_thumbs_prev:
+                game_start_time = _time.time()
+                game_state = "writing"
+                canvas = np.zeros_like(frame)
+        game_thumbs_prev = gesture_thumb
+
+        # ── Eraser ───────────────────────────────────────────────────────────
         if erase and eraser_center is not None:
             cv2.circle(canvas, eraser_center, 40, (0, 0, 0), -1)
             cv2.circle(image, eraser_center, 40, (0, 255, 255), 2)
-        # Kombinuj originalni snimak i platno da bi se videlo šta je nacrtano
+
         img_out = cv2.addWeighted(image, 0.5, canvas, 0.5, 0)
-        # Indikator aktivnog gesta (donji levi ugao kamere)
+
+        # Gesture badge
         if draw:
             _badge, _badge_col = "DRAW", (0, 180, 255)
         elif erase:
             _badge, _badge_col = "ERASE", (0, 210, 80)
         elif gesture_word:
             _badge, _badge_col = "COMMIT", (255, 160, 0)
+        elif game_mode and game_state == "ready" and gesture_thumb:
+            _badge, _badge_col = "START", (0, 220, 80)
         else:
             _badge, _badge_col = "", (0, 0, 0)
         if _badge:
@@ -620,15 +839,75 @@ with mp.tasks.vision.HandLandmarker.create_from_options(_options) as hands:
             cv2.rectangle(img_out, (_bx - 8, _by - _bh - 8), (_bx + _bw + 8, _by + 6), (20, 20, 20), -1)
             cv2.rectangle(img_out, (_bx - 8, _by - _bh - 8), (_bx + _bw + 8, _by + 6), _badge_col, 1)
             cv2.putText(img_out, _badge, (_bx, _by), UI_FONT, 0.62, _badge_col, 2, cv2.LINE_AA)
-        letters_grid = build_letters_grid(debug_letter_images)
-        panel = build_ui_panel(img_out.shape[0], recognized_text, last_recognized_display, letters_grid, word_count, img_out.shape[1])
+
+        # ── Build side panel ─────────────────────────────────────────────────
+        if game_mode:
+            panel = build_game_panel(img_out.shape[0])
+        else:
+            letters_grid = build_letters_grid(debug_letter_images)
+            panel = build_ui_panel(img_out.shape[0], recognized_text, last_recognized_display,
+                                   letters_grid, word_count, img_out.shape[1])
+
         dashboard = np.hstack((img_out, panel))
         cv2.imshow('Air Writing System', dashboard)
 
-        if cv2.waitKey(1) & 0xFF == 27:
+        # ── Keyboard input ───────────────────────────────────────────────────
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC
             break
-        # Izađi ako je prozor zatvoren (klik na X)
+        elif key == ord('g') or key == ord('G'):
+            game_mode = not game_mode
+            if game_mode:
+                # fresh session when entering game mode
+                game_target_word = ""
+                game_session_results.clear()
+                game_state = "nickname"
+                game_nickname = ""
+                game_nickname_input = ""
+                canvas = np.zeros_like(frame)
+        elif game_mode and game_state == "nickname":
+            if key == 13:  # ENTER
+                if game_nickname_input.strip():
+                    game_nickname = game_nickname_input.strip()
+                    game_nickname_input = ""
+                    # pick word only on the very first player of a session
+                    if not game_target_word:
+                        game_target_word = random.choice(GAME_WORDS)
+                    game_state = "ready"
+                    canvas = np.zeros_like(frame)
+            elif key == 8:  # BACKSPACE
+                game_nickname_input = game_nickname_input[:-1]
+            elif 32 <= key <= 126:
+                game_nickname_input += chr(key)
+        elif game_mode and game_state == "result":
+            if key == ord(' '):
+                canvas = np.zeros_like(frame)
+                debug_letter_images.clear()
+                last_recognized_display = ""
+                if game_result_match:
+                    # correct — next player, same word
+                    game_state = "nickname"
+                    game_nickname = ""
+                else:
+                    # wrong — same player tries again
+                    game_state = "ready"
+            elif key == ord('n') or key == ord('N'):
+                canvas = np.zeros_like(frame)
+                debug_letter_images.clear()
+                last_recognized_display = ""
+                if game_result_match:
+                    # correct — new word, new session
+                    game_target_word = random.choice(GAME_WORDS)
+                    game_session_results.clear()
+                    game_state = "nickname"
+                    game_nickname = ""
+                else:
+                    # wrong — next player, same word
+                    game_state = "nickname"
+                    game_nickname = ""
+
         if cv2.getWindowProperty('Air Writing System', cv2.WND_PROP_VISIBLE) < 1:
             break
+
 cap.release()
 cv2.destroyAllWindows()
