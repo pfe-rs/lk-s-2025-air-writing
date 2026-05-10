@@ -11,6 +11,7 @@ import json
 import re
 import time as _time
 import random
+import ctypes
 from itertools import groupby
 import torch
 import torch.nn as nn
@@ -102,6 +103,10 @@ def thumbs_up(lm) -> bool:
 NORMALIZE_MEAN = 0.1736
 NORMALIZE_STD = 0.3249
 
+_user32 = ctypes.windll.user32
+SCREEN_W: int = _user32.GetSystemMetrics(0)
+SCREEN_H: int = _user32.GetSystemMetrics(1)
+
 LETTER_GRID_COLS = 8
 LETTER_TILE = 56
 LETTER_MARGIN = 6
@@ -160,9 +165,13 @@ def clear_all():
 def mouse_callback(event, x, y, flags, param):
     """Callback za klik misa - proverava da li je kliknuto na dugme."""
     global button_hovered
+    # inverse-transform from display space to dashboard space
+    sc = _display_state["scale"]
+    sx = int((x - _display_state["x_off"]) / sc)
+    sy = int((y - _display_state["y_off"]) / sc)
     bx, by = button_rect["x"], button_rect["y"]
     bw, bh = button_rect["w"], button_rect["h"]
-    button_hovered = bx <= x <= bx + bw and by <= y <= by + bh
+    button_hovered = bx <= sx <= bx + bw and by <= sy <= by + bh
     if event == cv2.EVENT_LBUTTONDOWN and button_hovered:
         clear_all()
 
@@ -403,6 +412,11 @@ def _draw_landmarks(image, landmarks):
         cv2.line(image, pts[a], pts[b], (0, 255, 0), 2)
     for pt in pts:
         cv2.circle(image, pt, 4, (0, 0, 255), -1)
+
+# Shared dict between mouse_callback and main loop for display scaling
+_display_state = {"scale": 1.0, "x_off": 0, "y_off": 0}
+# Pre-allocated fullscreen buffer (reused every frame to avoid GC pressure)
+_padded_buf = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
 
 cap = cv2.VideoCapture(0)
 canvas = None
@@ -731,7 +745,8 @@ _options = mp.tasks.vision.HandLandmarkerOptions(
     min_hand_presence_confidence=0.5,
     min_tracking_confidence=0.5,
 )
-cv2.namedWindow('Air Writing System')
+cv2.namedWindow('Air Writing System', cv2.WINDOW_NORMAL)
+cv2.setWindowProperty('Air Writing System', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 cv2.setMouseCallback('Air Writing System', mouse_callback)
 
 with mp.tasks.vision.HandLandmarker.create_from_options(_options) as hands:
@@ -849,7 +864,22 @@ with mp.tasks.vision.HandLandmarker.create_from_options(_options) as hands:
                                    letters_grid, word_count, img_out.shape[1])
 
         dashboard = np.hstack((img_out, panel))
-        cv2.imshow('Air Writing System', dashboard)
+
+        # Scale dashboard to fill screen, letterbox if aspect ratio differs
+        dash_h, dash_w = dashboard.shape[:2]
+        scale = min(SCREEN_W / dash_w, SCREEN_H / dash_h)
+        disp_w = int(dash_w * scale)
+        disp_h = int(dash_h * scale)
+        x_off = (SCREEN_W - disp_w) // 2
+        y_off = (SCREEN_H - disp_h) // 2
+        _display_state["scale"] = scale
+        _display_state["x_off"] = x_off
+        _display_state["y_off"] = y_off
+        _padded_buf[:] = 0
+        _padded_buf[y_off:y_off + disp_h, x_off:x_off + disp_w] = cv2.resize(
+            dashboard, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR
+        )
+        cv2.imshow('Air Writing System', _padded_buf)
 
         # ── Keyboard input ───────────────────────────────────────────────────
         key = cv2.waitKey(1) & 0xFF
